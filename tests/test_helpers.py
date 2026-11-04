@@ -1069,8 +1069,8 @@ def test_message_bubbles_real_device_structure():
         ],
     }
     assert helpers._message_bubbles(tree, 440) == [
-        {"text": "Want a pizza?", "from_me": True},  # inner hugs the right
-        {"text": "Medium pls", "from_me": False},  # left; tapback+time stripped
+        {"text": "Want a pizza?", "from_me": True, "sender": "Your iMessage"},
+        {"text": "Medium pls", "from_me": False, "sender": "Elissa"},
     ]
 
 
@@ -1129,7 +1129,7 @@ def test_message_bubbles_your_prefix_fallback_without_inner():
         "children": [cell],
     }
     assert helpers._message_bubbles(tree, 440) == [
-        {"text": "On my way", "from_me": True},
+        {"text": "On my way", "from_me": True, "sender": "Your iMessage"},
     ]
 
 
@@ -1200,6 +1200,67 @@ def test_conversation_cells_exact_name_ordered_first():
     )
     cells = helpers._conversation_cells(tree, "Wes Sander")
     assert [c["text"] for c in cells] == ["Wes Sander", "Wes Sander Jr"]
+
+
+def test_conversation_cells_messages_in_row_is_chrome():
+    # iOS 27 search adds a 'Messages in: <name>' section row. It is a Cell
+    # and clears _title_matches by containment, so unfiltered it counts as
+    # a candidate and starves _open_thread's sole-candidate group path
+    # (bit live on Izalith, 2026-11-03, the 'Worken' group thread).
+    tree = _search_tree(
+        _search_cell("Messages in: Wes Sander", y=233),
+        _search_cell("Wes Sander"),
+    )
+    cells = helpers._conversation_cells(tree, "Wes Sander")
+    assert [c["text"] for c in cells] == ["Wes Sander"]
+
+
+def test_conversation_cells_ios27_group_structure():
+    # The real iOS 27 result set for the group thread 'Worken': a bare-name
+    # suggestion cell, the 'Messages in:' chrome row, and the conversation
+    # cell whose label leads with the group name and carries the preview.
+    preview = (
+        "Worken, Rick  reacted 👍 to “-Full paint, except the kitchen, "
+        "which you guys are leaving alone. , Yesterday"
+    )
+    tree = _search_tree(
+        _search_cell("Worken"),
+        _search_cell("Messages in: Worken", y=233),
+        _search_cell(preview, y=495),
+    )
+    texts = [c["text"] for c in helpers._conversation_cells(tree, "Worken")]
+    assert "Messages in: Worken" not in texts
+    assert preview in texts
+
+
+class _StaleClient:
+    """find_first that raises the way WDA does on a re-rendered list."""
+
+    def __init__(self, message):
+        self._message = message
+
+    def find_first(self, _chain):
+        raise WDAError(self._message)
+
+
+def test_find_first_fresh_reads_stale_as_no_match(monkeypatch):
+    # The polling probes (_open_thread search, _go_back) re-ask anyway;
+    # a stale throw must read as 'not yet', not kill the read (Izalith,
+    # 2026-11-03: read_messages died twice on exactly this).
+    monkeypatch.setattr(
+        helpers,
+        "_client",
+        _StaleClient("stale element reference: element is not present"),
+    )
+    assert helpers._find_first_fresh("**/XCUIElementTypeCell") is None
+
+
+def test_find_first_fresh_reraises_other_errors(monkeypatch):
+    monkeypatch.setattr(
+        helpers, "_client", _StaleClient("session not created: no session")
+    )
+    with pytest.raises(WDAError):
+        helpers._find_first_fresh("**/XCUIElementTypeCell")
 
 
 # ---- prompt-injection defense ----------------------------------------------

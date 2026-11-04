@@ -25,6 +25,26 @@ def client() -> WDAClient:
     return _client
 
 
+def _find_first_fresh(chain: str):
+    """find_first that reads a stale-element WDAError as 'not there (yet)'.
+
+    WDA element identity is snapshot-based: when the app re-renders a list
+    mid-lookup, a find can throw 'stale element reference' instead of
+    answering — iOS 27's Messages search results re-render constantly, and
+    on Izalith (2026-11-03) one uncaught stale throw from the _open_thread
+    search probe killed read_messages before any candidate was tapped,
+    twice in a row. Callers that POLL re-ask in a moment anyway, so for
+    them stale means 'no match yet', never fatal. Any other WDAError
+    still raises.
+    """
+    try:
+        return client().find_first(chain)
+    except WDAError as e:
+        if "stale element" in str(e).lower():
+            return None
+        raise
+
+
 # ---- perception ------------------------------------------------------------
 
 
@@ -1107,7 +1127,7 @@ def _go_back() -> bool:
     # screen). A bounded probe for the header button answers it; the full read
     # runs only while the probe still sees one, so _thread_title() keeps the
     # last word and the 5s deadline is unchanged.
-    while time.monotonic() < deadline and client().find_first(_THREAD_HEADER_CHAIN):
+    while time.monotonic() < deadline and _find_first_fresh(_THREAD_HEADER_CHAIN):
         if _thread_title(ui_tree()) is None:
             break
         time.sleep(_THREAD_POLL)
@@ -1123,12 +1143,21 @@ def _conversation_cells(tree: dict, contact: str) -> list[dict]:
     The 'Messages with: <name>' filter row is chrome, and message-content hits
     are not Cells, so a Cell that clears _title_matches/_leads_with is a
     conversation. Ordered exact-name first, like find_text.
+
+    iOS 27 adds a second chrome row, 'Messages in: <name>' (the in-thread
+    search section — seen live on Izalith, 2026-11-03): it is a Cell and it
+    clears _title_matches by containment, so unfiltered it counts as a
+    candidate and starves the sole-candidate group-thread path in
+    _open_thread. Same chrome family, same exclusion.
     """
     needle = contact.strip().lower()
     out = []
     for el in collect_texts(tree):
         label = el["text"].strip()
-        if el["type"] != "Cell" or label.lower().startswith("messages with:"):
+        lowered = label.lower()
+        if el["type"] != "Cell" or lowered.startswith(
+            ("messages with:", "messages in:")
+        ):
             continue
         if _title_matches(label, contact) or _leads_with(label, contact):
             out.append(el)
@@ -1201,7 +1230,7 @@ def _open_thread(contact: str) -> str | None:
     deadline = start + 20
     probe_until = start + _SEARCH_PROBE_SECONDS
     while True:
-        if time.monotonic() >= probe_until or client().find_first(cells_chain):
+        if time.monotonic() >= probe_until or _find_first_fresh(cells_chain):
             if _conversation_cells(ui_tree(), contact):
                 break
         if time.monotonic() >= deadline:
@@ -1260,7 +1289,10 @@ def _message_bubbles(tree: dict, width: float) -> list[dict]:
     'Your iMessage' when sent (why send_message never matches on 'iMessage').
     The Cell's inner Other repeats the label with the bubble's real geometry:
     which half of the screen it hugs gives from_me; the 'Your' prefix is the
-    fallback when no inner element is found.
+    fallback when no inner element is found. The parsed sender is RETURNED
+    (fork change, 2026-11-03): in a group thread 'from_me' alone leaves every
+    incoming bubble anonymous, and the name was already in hand — dropping
+    it made group reads useless for telling who said what.
     """
     els = collect_texts(tree)
     bubbles = []
@@ -1281,16 +1313,26 @@ def _message_bubbles(tree: dict, width: float) -> list[dict]:
         from_me = (
             inner["x"] > width / 2 if inner is not None else sender.startswith("Your")
         )
-        bubbles.append({"text": text, "from_me": from_me, "y": el["rect"]["y"]})
+        bubbles.append(
+            {
+                "text": text,
+                "from_me": from_me,
+                "sender": sender.strip(),
+                "y": el["rect"]["y"],
+            }
+        )
     bubbles.sort(key=lambda b: b["y"])
-    return [{"text": b["text"], "from_me": b["from_me"]} for b in bubbles]
+    return [
+        {"text": b["text"], "from_me": b["from_me"], "sender": b["sender"]}
+        for b in bubbles
+    ]
 
 
 def read_messages(contact: str, limit: int = 20) -> list[dict]:
     """Read the last messages of a conversation, oldest first.
 
-    Returns [{'text', 'from_me'}, ...]. Closes the loop send_message opened:
-    the agent can now see the reply, not just write.
+    Returns [{'text', 'from_me', 'sender'}, ...]. Closes the loop
+    send_message opened: the agent can now see the reply, not just write.
     """
     with trust.internal():  # navigating to the thread is bookkeeping, not content
         _open_thread(contact)
