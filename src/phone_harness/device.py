@@ -291,26 +291,101 @@ def tunnel_running(timeout: float = 10.0) -> bool:  # noqa: vulture  (called fro
     return False
 
 
-def ddi_mounted() -> bool:
-    """Is the personalized Developer Disk Image mounted? An iOS UPDATE silently
-    unmounts it, and without it testmanagerd refuses every test session — runwda
-    dies in dtx channel timeouts that look like a broken tunnel (bit live
-    2026-08-10, the 26.5→26.6 update). Mounted: `image list` prints a line with
-    a "signature" key; unmounted: msg "none"."""
+def _pmd3_run(args: list[str], timeout: float = 30.0) -> subprocess.CompletedProcess:
+    """Run the pymobiledevice3 CLI under this same interpreter. It is already
+    a requirements dependency (signing.py reads profiles through it), and
+    running it as a module keeps device.py free of its import graph — the
+    library is only loaded by the child process, never by the harness."""
+    return subprocess.run(
+        [sys.executable, "-m", "pymobiledevice3", *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+
+
+def _cryptex_ddi_mounted() -> bool:
+    """Is a Cryptex1 Developer Disk Image mounted at /System/Developer?
+
+    From iOS 27 the DDI is installed as a cryptex (over cryptexd), not as a
+    PersonalizedDMG through the image mounter, and its mounter entry carries
+    no ImageSignature — so go-ios `image list` reports "none" while the image
+    sits mounted and testmanagerd is live (measured live 2026-11-03,
+    iPhone19,3 / ApChipId 0x8160 on iOS 27.0.1: `pymobiledevice3 mounter
+    list` showed IsMounted at /System/Developer in the same minute `ios
+    image list` printed "none"). pymobiledevice3's `mounter list` reports
+    both image kinds, so it is the probe of record for the cryptex one.
+    Any failure — tool missing, timeout, unparseable output — is a plain
+    False: a probe that cannot see the image must never claim it."""
     try:
-        proc = _run(["image", "list"], timeout=15)
-    except (DeviceError, subprocess.TimeoutExpired):
+        proc = _pmd3_run(["mounter", "list"], timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
         return False
     if proc.returncode != 0:
         return False
-    return any(obj.get("signature") for obj in _json_lines(proc.stdout + proc.stderr))
+    text = proc.stdout.strip()
+    if not text:
+        return False
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return False
+    entries = parsed if isinstance(parsed, list) else [parsed]
+    return any(
+        isinstance(obj, dict)
+        and obj.get("IsMounted")
+        and (
+            obj.get("MountPath") == "/System/Developer"
+            or obj.get("PersonalizedImageType") == "DeveloperDiskImage"
+        )
+        for obj in entries
+    )
+
+
+def ddi_mounted() -> bool:
+    """Is the Developer Disk Image mounted? An iOS UPDATE silently
+    unmounts it, and without it testmanagerd refuses every test session — runwda
+    dies in dtx channel timeouts that look like a broken tunnel (bit live
+    2026-08-10, the 26.5→26.6 update). Mounted the classic way: `image list`
+    prints a line with a "signature" key; unmounted: msg "none". Mounted the
+    iOS 27 way (cryptex) there is no signature for go-ios to print, so the
+    pymobiledevice3 probe answers instead — it only runs when the go-ios
+    probe already said no, so machines with a classic image pay nothing."""
+    try:
+        proc = _run(["image", "list"], timeout=15)
+    except (DeviceError, subprocess.TimeoutExpired):
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        if any(obj.get("signature") for obj in _json_lines(proc.stdout + proc.stderr)):
+            return True
+    return _cryptex_ddi_mounted()
+
+
+def _mount_ddi_cryptex() -> subprocess.CompletedProcess | None:
+    """Install the DDI the iOS 27 way: `pymobiledevice3 mounter auto-mount`
+    personalizes and installs the Cryptex1 image (its own no-root tunnel,
+    image downloaded and TSS-signed by Apple), which is the ONLY route for
+    devices newer than the DDI's build manifest — a PersonalizedDMG identity
+    is tied to a chip/board pair the manifest lists, and a device it does
+    not list (e.g. the iPhone 18 series) has nothing to personalize.
+    Returns None when the tool itself could not run."""
+    try:
+        return _pmd3_run(["mounter", "auto-mount"], timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
 
 
 def mount_ddi() -> tuple[bool, str]:  # noqa: vulture  (called from admin.py)
-    """Mount the developer image (`ios image auto`). The phone must be UNLOCKED
+    """Mount the developer image. The phone must be UNLOCKED
     (iOS answers DeviceLocked otherwise); the first mount after an iOS update
-    also needs internet (Apple TSS signs the image). Success is verified by
-    re-probing, not by parsing the mount log."""
+    also needs internet (Apple TSS signs the image). Tries go-ios
+    (`ios image auto`, the PersonalizedDMG route) first and falls back to
+    the pymobiledevice3 cryptex route, which is the only one that exists
+    for iOS 27 devices newer than the DDI build manifest. A locked phone
+    is named before any fallback: it is the one failure a human can fix
+    on the spot, and the fallback would only fail the same way slower.
+    Success is verified by re-probing, not by parsing the mount log."""
     try:
         proc = _run(["image", "auto"], timeout=180)
     except (DeviceError, subprocess.TimeoutExpired) as exc:
@@ -320,6 +395,19 @@ def mount_ddi() -> tuple[bool, str]:  # noqa: vulture  (called from admin.py)
     out = proc.stdout + proc.stderr
     if "DeviceLocked" in out:
         return False, "phone is locked — unlock it, then retry"
+    cryptex = _mount_ddi_cryptex()
+    if cryptex is not None:
+        if ddi_mounted():
+            return True, "developer image mounted (cryptex, via pymobiledevice3)"
+        cout = cryptex.stdout + cryptex.stderr
+        if "DeviceLocked" in cout:
+            return False, "phone is locked — unlock it, then retry"
+        ctail = cout.strip().splitlines()[-1] if cout.strip() else "no output"
+        tail = out.strip().splitlines()[-1] if out.strip() else "no output"
+        return False, (
+            f"`ios image auto` did not mount: {tail}; "
+            f"cryptex auto-mount did not mount either: {ctail}"
+        )
     tail = out.strip().splitlines()[-1] if out.strip() else "no output"
     return False, f"`ios image auto` did not mount: {tail}"
 

@@ -105,6 +105,7 @@ def test_ddi_mounted_sees_signature_line(monkeypatch):
 def test_ddi_mounted_false_on_none(monkeypatch):
     out = '{"level":"INFO","msg":"none"}\n'
     monkeypatch.setattr(device, "_run", lambda args, timeout=30.0: _Proc(out))
+    monkeypatch.setattr(device, "_cryptex_ddi_mounted", lambda: False)
     assert not device.ddi_mounted()
 
 
@@ -125,6 +126,96 @@ def test_mount_ddi_verifies_by_reprobe(monkeypatch):
     ok, msg = device.mount_ddi()
     assert ok
     assert "mounted" in msg
+
+
+# ---- Cryptex DDI (iOS 27): go-ios is blind to it — its mounter entry has
+# no ImageSignature, so `image list` prints "none" while the image sits
+# mounted at /System/Developer (measured live 2026-11-03, iPhone19,3).
+# The pymobiledevice3 probe/mount pair below is the fork's fix.
+
+
+def test_ddi_mounted_sees_cryptex_entry(monkeypatch):
+    out = '{"level":"INFO","msg":"none"}\n'
+    monkeypatch.setattr(device, "_run", lambda args, timeout=30.0: _Proc(out))
+    monkeypatch.setattr(device, "_cryptex_ddi_mounted", lambda: True)
+    assert device.ddi_mounted()
+
+
+def test_ddi_mounted_cryptex_probe_survives_go_ios_missing(monkeypatch):
+    # go-ios not installed at all must not hide a mounted cryptex image:
+    # the classic probe failing is exactly when the fallback matters.
+    def _boom(args, timeout=30.0):
+        raise device.DeviceError("go-ios not found")
+
+    monkeypatch.setattr(device, "_run", _boom)
+    monkeypatch.setattr(device, "_cryptex_ddi_mounted", lambda: True)
+    assert device.ddi_mounted()
+
+
+def test_cryptex_probe_reads_mounted_entry(monkeypatch):
+    payload = json.dumps(
+        [
+            {
+                "DiskImageType": "Personalized",
+                "IsMounted": True,
+                "MountPath": "/System/Developer",
+                "PersonalizedImageType": "DeveloperDiskImage",
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        device, "_pmd3_run", lambda args, timeout=30.0: _Proc(payload)
+    )
+    assert device._cryptex_ddi_mounted()
+
+
+def test_cryptex_probe_false_when_entry_not_mounted(monkeypatch):
+    payload = json.dumps(
+        [{"IsMounted": False, "MountPath": "/System/Developer"}]
+    )
+    monkeypatch.setattr(
+        device, "_pmd3_run", lambda args, timeout=30.0: _Proc(payload)
+    )
+    assert not device._cryptex_ddi_mounted()
+
+
+def test_cryptex_probe_false_on_empty_and_garbage(monkeypatch):
+    monkeypatch.setattr(device, "_pmd3_run", lambda args, timeout=30.0: _Proc("[]"))
+    assert not device._cryptex_ddi_mounted()
+    monkeypatch.setattr(
+        device, "_pmd3_run", lambda args, timeout=30.0: _Proc("not json")
+    )
+    assert not device._cryptex_ddi_mounted()
+
+
+def test_mount_ddi_falls_back_to_cryptex(monkeypatch):
+    # The Run 1 failure, verbatim shape: go-ios has no image for the chip.
+    out = '{"level":"ERROR","msg":"no image for ApChipId 0x8160"}\n'
+    monkeypatch.setattr(device, "_run", lambda args, timeout=30.0: _Proc(out))
+    state = {"mounted": False}
+    monkeypatch.setattr(device, "ddi_mounted", lambda: state["mounted"])
+
+    def _fake_cryptex_mount():
+        state["mounted"] = True
+        return _Proc("DeveloperDiskImage mounted successfully")
+
+    monkeypatch.setattr(device, "_mount_ddi_cryptex", _fake_cryptex_mount)
+    ok, msg = device.mount_ddi()
+    assert ok
+    assert "cryptex" in msg
+
+
+def test_mount_ddi_reports_both_failures(monkeypatch):
+    out = '{"level":"ERROR","msg":"go-ios tail line"}\n'
+    monkeypatch.setattr(device, "_run", lambda args, timeout=30.0: _Proc(out))
+    monkeypatch.setattr(device, "ddi_mounted", lambda: False)
+    monkeypatch.setattr(
+        device, "_mount_ddi_cryptex", lambda: _Proc("cryptex tail line")
+    )
+    ok, msg = device.mount_ddi()
+    assert not ok
+    assert "go-ios tail line" in msg
+    assert "cryptex tail line" in msg
 
 
 def test_wda_bundle_no_cache_fallback_when_app_really_absent(monkeypatch, tmp_path):
