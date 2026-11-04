@@ -425,7 +425,7 @@
     </div>
     <div id="screen-slot">
       <div id="screen-wrap">
-        <img id="screen" alt="phone screen" src="/api/screenshot">
+        <img id="screen" alt="phone screen" src="/api/screenshot" draggable="false">
         <div id="tap-dot"></div>
         <div id="hold-ring"></div>
         <div id="swipe-echo"></div>
@@ -1189,6 +1189,13 @@ async function fireLongPress(cx, cy) {
   await postGesture('/api/long_press',
     {x: p.x, y: p.y, seconds: LONG_PRESS_SECONDS}, cx - r.left, cy - r.top);
 }
+
+// A mouse drag on the <img> itself starts the browser's native image
+// drag (ghost preview follows the cursor), which kills pointer capture
+// mid-gesture and eats the swipe. -webkit-user-drag:none in the CSS is
+// not reliably honored on a replaced element in Blink/Edge, so the
+// draggable=false attribute in the markup gets a backstop here.
+screen.addEventListener('dragstart', (ev) => ev.preventDefault());
 
 screen.addEventListener('pointerdown', (ev) => {
   if (!points) return;
