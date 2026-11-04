@@ -2323,6 +2323,10 @@ def test_human_gestures_run_with_the_idle_wait_off(base_url):
         ("/api/swipe", {"x1": 1, "y1": 2, "x2": 3, "y2": 4}),
         ("/api/long_press", {"x": 10, "y": 20}),
         ("/api/key", {"key": "a"}),
+        # The stub's find_first answers every chain, so the probe reads
+        # keyboard-up and this takes the caret path — still a human
+        # gesture, so the idle wait still drops and restores around it.
+        ("/api/arrow", {"key": "ArrowDown"}),
         # The real keystroke path: flushKeys and the paste box both POST here,
         # and nothing reads the tree after it. /api/text is NOT here — it runs
         # send_message, which reads the field back before it taps Send.
@@ -2646,3 +2650,117 @@ def test_photos_worker_never_stays_running_on_a_crash(monkeypatch):
         job = dict(viewer._PHOTO_JOB)
     assert job["running"] is False and job["ok"] is False
     assert "usbmux fell over" in job["message"]
+
+
+def test_live_drag_streams_legs_while_the_finger_is_down():
+    # A drag used to be collected whole and sent as ONE swipe on release:
+    # the phone sat still for the entire drag, then replayed it (Steven, on
+    # device 2026-11-04). Crossing the 8px threshold now starts streaming
+    # legs over /api/swipe while the finger is still down. The single-swipe
+    # path survives for a drag too fast to produce a pointermove — that
+    # fallback is pinned by test_drag_swipe_times_from_the_first_movement.
+    import re
+
+    html = (Path(viewer.__file__).parent / "viewer.html").read_text(encoding="utf-8")
+    move = re.search(r"screen\.addEventListener\('pointermove'.*?\n\}\);", html, re.S)
+    assert move and "beginLiveDrag(ev)" in move.group(0), (
+        "crossing the threshold must start the stream from pointermove"
+    )
+    assert "const LIVE_SEG_MIN_PT = 10;" in html, (
+        "the leg floor is a guess; it must be one named constant to walk back"
+    )
+    pump = re.search(r"async function pumpLive\(d, force\) \{(.*?)\n\}", html, re.S)
+    assert pump, "pumpLive changed shape — the leg pump lives inside it"
+    body = pump.group(1)
+    assert "/api/swipe" in body, "legs ride the existing swipe endpoint"
+    assert "reportNotSent(" in body, "a refused leg must be said, not swallowed"
+    assert "LIVE_SEG_MIN_PT" in body and "LIVE_SEG_MAX_S" in body, (
+        "leg floors and pacing ride the named constants"
+    )
+    up = re.search(r"screen\.addEventListener\('pointerup'.*?\n\}\);", html, re.S)
+    assert up and "start.liveFrom" in up.group(0), (
+        "release must take the streamed branch when legs went out"
+    )
+    assert "drainLive(start)" in up.group(0), (
+        "release waits for the queued legs instead of dropping the tail"
+    )
+
+
+def _arrow_probe(client, keyboard):
+    """find_first stand-in: the keyboard chain answers `keyboard`, the
+    page-indicator chain keeps its shipped answer."""
+
+    def probe(chain):
+        client.calls.append(("find_first", chain))
+        if chain == viewer._KEYBOARD_CHAIN:
+            return "keyboard-id" if keyboard else None
+        return "page-indicator"
+
+    return probe
+
+
+def test_arrow_swipes_when_the_keyboard_is_down(base_url):
+    # No keyboard: the arrow can only be navigation. Down reads the next
+    # content, so the finger swipes UP from screen center (the arrow
+    # points the way the viewport moves).
+    client = viewer.Handler.client
+    client.window = (440, 956)
+    client.find_first = _arrow_probe(client, keyboard=False)
+    mark = len(client.calls)
+    try:
+        r = requests.post(base_url + "/api/arrow", json={"key": "ArrowDown"}, timeout=5)
+    finally:
+        del client.find_first
+        client.window = None
+    assert r.ok, r.status_code
+    new = client.calls[mark:]
+    assert ("find_first", viewer._KEYBOARD_CHAIN) in new
+    swipes = [c for c in new if c[0] == "swipe"]
+    assert len(swipes) == 1, new
+    _tag, x1, y1, x2, y2 = swipes[0]
+    assert x1 == x2 == 220 and y1 == 478 and y2 < y1, swipes
+    assert not [c for c in new if c[0] == "key_press"], new
+
+
+def test_arrow_is_a_caret_key_when_the_keyboard_is_up(base_url):
+    # Keyboard up: the arrow keeps its /api/key meaning exactly — the
+    # WebDriver code for the same arrow, and no swipe.
+    client = viewer.Handler.client
+    client.window = (440, 956)
+    client.find_first = _arrow_probe(client, keyboard=True)
+    mark = len(client.calls)
+    try:
+        r = requests.post(base_url + "/api/arrow", json={"key": "ArrowDown"}, timeout=5)
+    finally:
+        del client.find_first
+        client.window = None
+    assert r.ok, r.status_code
+    new = client.calls[mark:]
+    assert ("key_press", "\ue015") in new, new
+    assert not [c for c in new if c[0] == "swipe"], new
+
+
+def test_arrow_rejects_a_non_arrow_key(base_url):
+    client = viewer.Handler.client
+    mark = len(client.calls)
+    r = requests.post(base_url + "/api/arrow", json={"key": "PageDown"}, timeout=5)
+    assert r.status_code == 400, r.status_code
+    assert client.calls[mark:] == [], "a refused key must not touch the phone"
+
+
+def test_arrow_keys_route_to_the_nav_endpoint():
+    # The page side of /api/arrow: the four arrows leave the ARROW_KEYS
+    # caret path (Delete/Home/End/PageUp/PageDown stay on it), and the
+    # drain stops at the first refusal like sendArrowKey's does — half a
+    # held key's repeats landing after a refusal is worse than none.
+    import re
+
+    html = (Path(viewer.__file__).parent / "viewer.html").read_text(encoding="utf-8")
+    assert "NAV_ARROW_KEYS.has(ev.key)" in html
+    assert "sendNavArrow(ev.key)" in html
+    nav = re.search(r"async function sendNavArrow\(key\) \{(.*?)\n\}", html, re.S)
+    assert nav, "sendNavArrow changed shape"
+    assert "/api/arrow" in nav.group(1)
+    assert "reportNotSent(" in nav.group(1), (
+        "a refused arrow must be reported, not swallowed"
+    )

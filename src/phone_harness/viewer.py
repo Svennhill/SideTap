@@ -569,6 +569,22 @@ def _parse_console(line: str) -> tuple[str, list, dict]:
     return name, args, kwargs
 
 
+# The four keyboard arrows, WebDriver key codes — the same values the
+# page's ARROW_KEYS map sends to /api/key when they mean caret movement.
+_ARROW_KEY_CODES = {
+    "ArrowLeft": "\ue012",
+    "ArrowRight": "\ue014",
+    "ArrowUp": "\ue013",
+    "ArrowDown": "\ue015",
+}
+
+# The keyboard-presence probe /api/arrow uses: the one bounded class
+# chain helpers._await_keyboard waits on (~330ms measured on device).
+# Duplicated as a literal because helpers keeps its copy private to the
+# send path; the two must stay the same chain.
+_KEYBOARD_CHAIN = "**/XCUIElementTypeKeyboard"
+
+
 class Handler(BaseHTTPRequestHandler):
     client = WDAClient(timeout=10)
 
@@ -957,6 +973,40 @@ class Handler(BaseHTTPRequestHandler):
                 with _human_gesture(self.client):
                     self.client.key_press(str(payload["key"]))
                 self._json({"ok": True})
+            elif path == "/api/arrow":
+                # An arrow key means two things and the phone knows which:
+                # with the keyboard up it is a caret key (exactly what
+                # /api/key sends); with no keyboard it can only be
+                # navigation, so it becomes a swipe. The arrow points the
+                # way the VIEWPORT moves — Down reads the next content, so
+                # the finger swipes up — and the geometry mirrors
+                # flushWheel: 45% of the screen from center, a flick past
+                # 150pt of travel. The probe is one bounded lookup, once
+                # per press, never polled; /element/active is not an
+                # option (it answers a Messages bubble while the caret
+                # sits in the compose bar — see wda_client's note).
+                key = str(payload.get("key", ""))
+                if key not in _ARROW_KEY_CODES:
+                    self._json({"error": f"not an arrow key: {key!r}"}, 400)
+                else:
+                    with _human_gesture(self.client):
+                        if self.client.find_first(_KEYBOARD_CHAIN):
+                            self.client.key_press(_ARROW_KEY_CODES[key])
+                        else:
+                            w, h = self.client.window_size()
+                            cx, cy = w / 2, h / 2
+                            tx, ty = w * 0.45, h * 0.45
+                            if key == "ArrowDown":
+                                x1, y1, x2, y2 = cx, cy, cx, cy - ty
+                            elif key == "ArrowUp":
+                                x1, y1, x2, y2 = cx, cy, cx, cy + ty
+                            elif key == "ArrowRight":
+                                x1, y1, x2, y2 = cx, cy, cx - tx, cy
+                            else:  # ArrowLeft
+                                x1, y1, x2, y2 = cx, cy, cx + tx, cy
+                            seconds = 0.15 if max(tx, ty) > 150 else 0.25
+                            self.client.swipe(x1, y1, x2, y2, seconds)
+                    self._json({"ok": True})
             elif path == "/api/enter":
                 # A bare Enter while typing into the phone: tap Send when a
                 # Send button is on screen (Messages, and any app that labels
