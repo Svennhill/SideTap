@@ -118,8 +118,55 @@ def test_thread_title_reads_contact_photo_button():
 
 
 def test_thread_title_none_when_no_header_button():
-    # A group thread / unknown layout has no "Contact photo for X" button.
+    # No "Contact photo for X" header button at all: not a thread screen.
     assert _thread_title(SAMPLE_TREE) is None
+
+
+def _header_tree(*buttons):
+    return {
+        "type": "Application",
+        "rect": {"x": 0, "y": 0, "width": 440, "height": 956},
+        "children": [
+            {
+                "type": "Button",
+                "label": label,
+                "isVisible": "1",
+                "rect": {"x": x, "y": y, "width": w, "height": h},
+            }
+            for label, x, y, w, h in buttons
+        ],
+    }
+
+
+def test_thread_title_group_reads_name_button_not_photo():
+    # Measured on Izalith (iOS 27, 2026-11-03), group thread 'Worken': the
+    # photo cluster is ONE button naming a single participant. Reading it
+    # as the title made _open_thread reject the correct group as a wrong
+    # 1:1 thread with 'Big Poppa'. The name button below is the title.
+    tree = _header_tree(
+        ("Back", 20, 61, 79, 45),
+        ("Contact photo for Big Poppa", 190, 61, 60, 61),
+        ("Worken", 171, 116, 98, 34),
+    )
+    assert _thread_title(tree) == "Worken"
+
+
+def test_thread_title_one_to_one_name_button_agrees():
+    # Same measured layout, 1:1 thread: name button under the photo
+    # (labels carry trailing spaces on device; the title is stripped).
+    tree = _header_tree(
+        ("Back", 20, 62, 79, 45),
+        ("Contact photo for Rick ", 190, 62, 60, 61),
+        ("Rick ", 183, 117, 74, 33),
+    )
+    assert _thread_title(tree) == "Rick"
+
+
+def test_thread_title_name_button_needs_a_photo_header():
+    # A stray name-shaped button with no photo header proves nothing:
+    # the list must still read as unverifiable, never as a thread.
+    tree = _header_tree(("Worken", 171, 116, 98, 34))
+    assert _thread_title(tree) is None
 
 
 def test_thread_title_ignores_list_row_photos():
@@ -1070,7 +1117,12 @@ def test_message_bubbles_real_device_structure():
     }
     assert helpers._message_bubbles(tree, 440) == [
         {"text": "Want a pizza?", "from_me": True, "sender": "Your iMessage"},
-        {"text": "Medium pls", "from_me": False, "sender": "Elissa"},
+        {
+            "text": "Medium pls",
+            "from_me": False,
+            "sender": "Elissa",
+            "tapback": "You liked this",
+        },
     ]
 
 
@@ -1130,6 +1182,45 @@ def test_message_bubbles_your_prefix_fallback_without_inner():
     }
     assert helpers._message_bubbles(tree, 440) == [
         {"text": "On my way", "from_me": True, "sender": "Your iMessage"},
+    ]
+
+
+def test_message_bubbles_ios27_reacted_with_tapback():
+    # Measured on Izalith (iOS 27, 2026-11-03), the Worken scope bubble:
+    # the reaction rides INSIDE the label as ', Rick  reacted with 👍'
+    # (two spaces on device), ahead of the time. It must leave the text
+    # and land on the bubble as its own field — and the message's own
+    # commas must survive: the reaction clause starts at the reactor's
+    # name, not at the first comma the regex can reach.
+    single = (
+        "Your Text Message, Full paint, except the kitchen, "
+        "Rick  reacted with 👍, 12:56 PM"
+    )
+    multiline = (
+        "Your Text Message, line one\nline two, "
+        "Rick  reacted with 👍, 12:56 PM"
+    )
+    tree = {
+        "type": "Application",
+        "rect": {"x": 0, "y": 0, "width": 440, "height": 956},
+        "children": [
+            _bubble_cell(single, 186, 109, 311),
+            _bubble_cell(multiline, 500, 109, 311),
+        ],
+    }
+    assert helpers._message_bubbles(tree, 440) == [
+        {
+            "text": "Full paint, except the kitchen",
+            "from_me": True,
+            "sender": "Your Text Message",
+            "tapback": "Rick  reacted with 👍",
+        },
+        {
+            "text": "line one\nline two",
+            "from_me": True,
+            "sender": "Your Text Message",
+            "tapback": "Rick  reacted with 👍",
+        },
     ]
 
 

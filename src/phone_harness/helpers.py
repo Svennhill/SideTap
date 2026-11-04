@@ -1006,27 +1006,52 @@ def _dedup_rows(hits: list[dict]) -> list[dict]:
 
 
 def _thread_title(tree: dict) -> str | None:
-    """Recipient name of the open one-to-one Messages thread, or None.
+    """Title of the open Messages thread (1:1 or group), or None.
 
     Pure function (unit-tested). This iOS build puts the app word "Messages" in
-    the NavigationBar (verified on device), so we read the thread header instead:
-    the "Contact photo for <name>" button names a 1:1 thread's recipient. The
-    conversation LIST also shows contact photos (verified on device
+    the NavigationBar (verified on device), so we read the thread header instead.
+    The conversation LIST also shows contact photos (verified on device
     2026-08-09), but those hug the left edge of their rows — only a photo
     centered in the nav area (top of the screen, clear of the left edge) is
-    the header. None = the list, or a thread the layout cannot name (groups) —
-    the caller treats None as "cannot verify".
+    the header. None = the list — the caller treats None as "cannot verify".
+
+    Fork change (2026-11-03), measured on Izalith's iOS 27 headers: a GROUP
+    header carries the same single "Contact photo for <one participant>"
+    button as a 1:1 header — the photo cluster is exposed as one button
+    naming whoever comes first — so the photo button alone read the group
+    'Worken' as a 1:1 thread with 'Big Poppa' and _open_thread rejected the
+    correct thread as wrong. Both layouts ALSO carry a name button directly
+    under the photo (group 'Worken' at y=116; 1:1 'Rick' at y=117), and that
+    button is the thread's real title in both cases. Prefer it; fall back
+    to the photo name for layouts with no name button (the original iOS 18
+    structure the unit tests pin).
     """
     prefix = "Contact photo for "
-    for el in collect_texts(tree):
+    els = collect_texts(tree)
+    photo_name = None
+    for el in els:
         if (
             el["type"] == "Button"
             and el["text"].startswith(prefix)
             and el["rect"]["y"] < 140
             and el["rect"]["x"] > 130
         ):
-            return el["text"][len(prefix) :].strip()
-    return None
+            photo_name = el["text"][len(prefix) :].strip()
+            break
+    if photo_name is None:
+        return None
+    for el in els:
+        text = el["text"].strip()
+        if (
+            el["type"] == "Button"
+            and 105 <= el["rect"]["y"] <= 160
+            and el["rect"]["width"] <= 300
+            and text
+            and not text.startswith(prefix)
+            and text != "Back"
+        ):
+            return text
+    return photo_name
 
 
 def _log_action(
@@ -1275,8 +1300,17 @@ def _open_thread(contact: str) -> str | None:
 
 # Bubble labels end with a time and sometimes a tapback note; both are chrome.
 _BUBBLE_TIME = re.compile(r",\s*\d{1,2}:\d{2}(\s*[AP]M)?\s*$", re.IGNORECASE)
+# Two tapback wordings: the classic ", <name> liked/loved/… this" and iOS 27's
+# ", <name> reacted with <emoji>", which iOS 27 appends INSIDE the reacted
+# bubble's own label (measured on Izalith, 2026-11-03: '…, Rick  reacted
+# with 👍, 12:56 PM'). Neither group may contain a comma: a reaction clause
+# starts at the LAST comma that can begin one, so message text with its own
+# commas ('Full paint, except the kitchen, Rick reacted with 👍') keeps
+# everything up to the reactor's name. Callers strip repeatedly, so stacked
+# reactions come off one at a time, innermost last.
 _BUBBLE_TAPBACK = re.compile(
-    r",\s*\S+\s+(liked|loved|laughed at|emphasized|disliked|questioned)\s+this\s*$",
+    r",\s*(?:\S+\s+(?:liked|loved|laughed at|emphasized|disliked|questioned)\s+this"
+    r"|[^,]+?\s+reacted with\s+[^,]+?)\s*$",
     re.IGNORECASE,
 )
 
@@ -1301,7 +1335,13 @@ def _message_bubbles(tree: dict, width: float) -> list[dict]:
             continue
         sender, text = el["text"].split(", ", 1)
         text = _BUBBLE_TIME.sub("", text.replace("\u202f", " ")).strip()
-        text = _BUBBLE_TAPBACK.sub("", text).strip()
+        # Tapbacks are reaction chrome, not message text — but they are not
+        # nothing, either: strip them off the text and RECORD them on the
+        # bubble ('tapback'), innermost reaction first if several stack.
+        tapbacks = []
+        while (m := _BUBBLE_TAPBACK.search(text)) is not None:
+            tapbacks.insert(0, m.group(0).lstrip(", ").strip())
+            text = text[: m.start()].strip()
         inner = next(
             (
                 e
@@ -1313,25 +1353,30 @@ def _message_bubbles(tree: dict, width: float) -> list[dict]:
         from_me = (
             inner["x"] > width / 2 if inner is not None else sender.startswith("Your")
         )
-        bubbles.append(
-            {
-                "text": text,
-                "from_me": from_me,
-                "sender": sender.strip(),
-                "y": el["rect"]["y"],
-            }
-        )
+        bubble = {
+            "text": text,
+            "from_me": from_me,
+            "sender": sender.strip(),
+            "y": el["rect"]["y"],
+        }
+        if tapbacks:
+            bubble["tapback"] = "; ".join(tapbacks)
+        bubbles.append(bubble)
     bubbles.sort(key=lambda b: b["y"])
-    return [
-        {"text": b["text"], "from_me": b["from_me"], "sender": b["sender"]}
-        for b in bubbles
-    ]
+    out = []
+    for b in bubbles:
+        item = {"text": b["text"], "from_me": b["from_me"], "sender": b["sender"]}
+        if "tapback" in b:
+            item["tapback"] = b["tapback"]
+        out.append(item)
+    return out
 
 
 def read_messages(contact: str, limit: int = 20) -> list[dict]:
     """Read the last messages of a conversation, oldest first.
 
-    Returns [{'text', 'from_me', 'sender'}, ...]. Closes the loop
+    Returns [{'text', 'from_me', 'sender'}, ...] — a bubble carrying a
+    tapback also gets a 'tapback' entry naming it. Closes the loop
     send_message opened: the agent can now see the reply, not just write.
     """
     with trust.internal():  # navigating to the thread is bookkeeping, not content
